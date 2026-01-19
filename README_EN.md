@@ -2,41 +2,36 @@
 
 An Index/Detail compaction tool for Claude Code. It hooks into **PreCompact** to generate a concise index and a detailed transcript, reducing token usage while preserving critical context.
 
----
+## Overview
+This tool generates a two-layer context snapshot before compaction:
+- **Index layer**: decisions, constraints, TODOs, and open questions required to continue the task.
+- **Detail layer**: the last ~30 raw messages for on‑demand recovery.
 
-## Why this tool
-Claude Code may compact long conversations, which can drop important decisions or constraints. This tool implements a **dual-layer memory**:
+## Motivation
+Claude Code compaction can drop key decisions or constraints in long conversations. This tool keeps the context lightweight while preserving recoverability via structured index + detailed transcript.
 
-- **Index layer**: decisions, constraints, TODOs, and open questions needed to continue the task.
-- **Detail layer**: full excerpts for on-demand recovery.
-
-This keeps the conversation lightweight while preserving recoverability.
-
----
-
-## What it does
-- Generates `index.md` + `detail.md` before compaction
-- Outputs structured `index.json` / `detail.json`
-- Multi-round lifecycle: Active / Updated / Archived / Dropped
+## Features
+- PreCompact Hook generates `index.md` / `detail.md`
+- Structured `index.json` / `detail.json`
+- Lifecycle across rounds: Active / Updated / Archived / Dropped
 - Interactive CLI selection (Keep / Drop / Pin / Archive)
-- Snapshot history under `snapshots/`
+- Snapshot history in `snapshots/`
 
----
+## Prerequisites
+- **Claude Code** installed
+- **python3** available
+- Permission to edit `~/.claude/settings.json`
 
 ## Installation
-
 ### 1) Copy the hook script
-Save the script to:
-```
-~/.claude/hooks/precompact-index-detail.sh
-```
-Make it executable:
 ```bash
+mkdir -p ~/.claude/hooks
+cp ./precompact-index-detail.sh ~/.claude/hooks/precompact-index-detail.sh
 chmod +x ~/.claude/hooks/precompact-index-detail.sh
 ```
 
 ### 2) Register the PreCompact hook
-Edit `~/.claude/settings.json` and add:
+Edit `~/.claude/settings.json` and add under `hooks`:
 ```json
 "PreCompact": [
   {
@@ -47,17 +42,30 @@ Edit `~/.claude/settings.json` and add:
   }
 ]
 ```
-> Replace with your actual path.
+> Replace with your actual path and merge with existing hooks.
 
----
+## Configuration
+- **Interactive toggle** (enabled by default):
+  ```bash
+  INDEX_DETAIL_INTERACTIVE=0
+  ```
+
+- **retain.json** (optional manual edits):
+  ```json
+  {
+    "pinned_ids": [],
+    "drop_ids": [],
+    "manual_status": {
+      "id": "archived"
+    }
+  }
+  ```
 
 ## Usage
-
 ### 1) Normal Claude Code usage
-When Claude Code compaction triggers, the hook runs automatically.
+When compaction triggers, the hook runs automatically.
 
 ### 2) Interactive selection
-You will see:
 ```
 [Index/Detail] Select items (Enter=Keep, d=Drop, p=Pin, a=Archive, q=Quit)
 ```
@@ -67,8 +75,12 @@ You will see:
 - a = Archive
 - q = Quit
 
-### 3) Output location
-Files are written to:
+### 3) Manual test run
+```bash
+~/.claude/hooks/precompact-index-detail.sh
+```
+
+## Output structure
 ```
 <project>/.claude/
   index.md
@@ -79,21 +91,9 @@ Files are written to:
   snapshots/
 ```
 
-### 4) Manual test run
-```bash
-~/.claude/hooks/precompact-index-detail.sh
-```
-
----
-
-## Notes
-- `$HOME` is redacted to `~` by default
-- Disable interactive mode with:
-```bash
-INDEX_DETAIL_INTERACTIVE=0
-```
-
----
+## Security & Privacy
+- `$HOME` is redacted to `~` by default.
+- All outputs are stored under the project’s `.claude/` directory.
 
 ## License
 MIT
