@@ -10,15 +10,13 @@ TIMESTAMP="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
 INDEX_MD="$OUT_DIR/index.md"
 DETAIL_MD="$OUT_DIR/detail.md"
 INDEX_JSON="$OUT_DIR/index.json"
-DETAIL_JSON="$OUT_DIR/detail.json"
 RETAIN_JSON="$OUT_DIR/retain.json"
 
 SNAP_INDEX_MD="$SNAP_DIR/$TIMESTAMP.index.md"
 SNAP_DETAIL_MD="$SNAP_DIR/$TIMESTAMP.detail.md"
 SNAP_INDEX_JSON="$SNAP_DIR/$TIMESTAMP.index.json"
-SNAP_DETAIL_JSON="$SNAP_DIR/$TIMESTAMP.detail.json"
 
-export PROJECT_ROOT OUT_DIR SNAP_DIR TIMESTAMP INDEX_MD DETAIL_MD INDEX_JSON DETAIL_JSON RETAIN_JSON SNAP_INDEX_MD SNAP_DETAIL_MD SNAP_INDEX_JSON SNAP_DETAIL_JSON
+export PROJECT_ROOT OUT_DIR SNAP_DIR TIMESTAMP INDEX_MD DETAIL_MD INDEX_JSON RETAIN_JSON SNAP_INDEX_MD SNAP_DETAIL_MD SNAP_INDEX_JSON
 
 python3 - <<'PY'
 import json
@@ -27,7 +25,6 @@ import pathlib
 import re
 import sys
 import hashlib
-from datetime import datetime, timezone
 
 project_root = os.environ.get("PROJECT_ROOT") or os.getcwd()
 out_dir = os.environ["OUT_DIR"]
@@ -36,23 +33,26 @@ timestamp = os.environ["TIMESTAMP"]
 index_md = os.environ["INDEX_MD"]
 detail_md = os.environ["DETAIL_MD"]
 index_json = os.environ["INDEX_JSON"]
-detail_json = os.environ["DETAIL_JSON"]
 retain_json = os.environ["RETAIN_JSON"]
 snap_index_md = os.environ["SNAP_INDEX_MD"]
 snap_detail_md = os.environ["SNAP_DETAIL_MD"]
 snap_index_json = os.environ["SNAP_INDEX_JSON"]
-snap_detail_json = os.environ["SNAP_DETAIL_JSON"]
 
 home = os.path.expanduser("~")
+write_md = os.environ.get("INDEX_DETAIL_WRITE_MD", "1") != "0"
+
 
 def redact(text: str) -> str:
     return text.replace(home, "~")
 
+
 def write_text(path: str, content: str) -> None:
     pathlib.Path(path).write_text(content, encoding="utf-8")
 
+
 def write_json(path: str, data) -> None:
     pathlib.Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def tokenize(s: str):
     s = s.lower()
@@ -60,18 +60,59 @@ def tokenize(s: str):
         return {c for c in s if not c.isspace()}
     return set(re.findall(r"[a-z0-9]+", s))
 
+
 def similarity(a: str, b: str) -> float:
     ta, tb = tokenize(a), tokenize(b)
     if not ta or not tb:
         return 0.0
     return len(ta & tb) / len(ta | tb)
 
-def stable_id(item_type: str, summary: str) -> str:
-    h = hashlib.sha1(f"{item_type}:{summary}".encode("utf-8")).hexdigest()[:12]
-    return f"{item_type}_{h}"
+
+def stable_id(text: str) -> str:
+    h = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    return f"item_{h}"
+
 
 def truncate(text: str, limit: int = 160):
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def clean_line(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^[\s\-*\d\.]+", "", line)
+    line = re.sub(r"\s+", " ", line).strip()
+    return line
+
+
+def make_title(line: str) -> str:
+    line = clean_line(line)
+    if not line:
+        return ""
+    if re.search(r"[\u4e00-\u9fff]", line):
+        return truncate(line, 24)
+    words = line.split()
+    return truncate(" ".join(words[:8]), 60)
+
+
+def make_description(line: str) -> str:
+    return truncate(clean_line(line), 140)
+
+
+def make_summary(line: str) -> str:
+    return truncate(clean_line(line), 160)
+
+
+def add_unique(lst, value):
+    if value not in lst:
+        lst.append(value)
+
+
+def remove_if_present(lst, value):
+    if value in lst:
+        lst.remove(value)
+
+
+
 
 # Locate sessions-index.json
 
@@ -99,120 +140,221 @@ def find_sessions_index(project_root: str) -> str:
 
     return candidate
 
-sess_index = find_sessions_index(project_root)
+
+def pick_session_from_index(sess_index: str):
+    if not os.path.exists(sess_index):
+        return None, None
+    try:
+        data = json.load(open(sess_index, "r", encoding="utf-8"))
+    except Exception:
+        return None, None
+    entries = data.get("entries", [])
+    if not entries:
+        return None, None
+    latest = max(entries, key=lambda e: e.get("modified") or e.get("fileMtime") or 0)
+    return latest.get("fullPath"), latest.get("sessionId")
+
+
+def pick_latest_jsonl(project_dir: str):
+    if not os.path.isdir(project_dir):
+        return None, None
+    jsonls = [os.path.join(project_dir, name) for name in os.listdir(project_dir) if name.endswith(".jsonl")]
+    if not jsonls:
+        return None, None
+    latest_path = max(jsonls, key=lambda p: os.path.getmtime(p))
+    return latest_path, pathlib.Path(latest_path).stem
+
+
+def render_index_md(data):
+    lines = [
+        "# Index (auto)",
+        f"> Generated: {data.get('generated')}",
+        f"> Project: {data.get('project')}",
+        f"> Session: {data.get('session_id')}",
+        f"> Source: {data.get('source')}",
+        "",
+        "## Cards"
+    ]
+
+    items = data.get("items", [])
+    if not items:
+        lines.append("- (none detected)")
+        return "\n".join(lines).strip() + "\n"
+
+    def fmt(item):
+        flags = []
+        if item.get("pinned"):
+            flags.append("PIN")
+        status = item.get("status")
+        if status and status != "active":
+            flags.append(status.upper())
+        suffix = f" [{'|'.join(flags)}]" if flags else ""
+        return f"- `{item.get('id')}` {item.get('title')} — {item.get('description')}{suffix}"
+
+    for item in items:
+        lines.append(fmt(item))
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def render_detail_md(data):
+    lines = [
+        "# Detail (auto)",
+        f"> Generated: {data.get('generated')}",
+        f"> Project: {data.get('project')}",
+        f"> Session: {data.get('session_id')}",
+        f"> Source: {data.get('source')}",
+        "",
+        "## Cards"
+    ]
+
+    items = data.get("items", [])
+    if not items:
+        lines.append("- (none detected)")
+        return "\n".join(lines).strip() + "\n"
+
+    for item in items:
+        status = item.get("status", "active")
+        if item.get("pinned"):
+            status = f"{status} (PIN)"
+        detail = item.get("detail", {}) or {}
+        summary = detail.get("summary", "")
+        quote = detail.get("quote", "")
+
+        lines.append(f"## {item.get('id')} — {item.get('title')}")
+        lines.append(f"- Status: {status}")
+        lines.append(f"- Summary: {summary}")
+        lines.append("- Quote:")
+        lines.append("```")
+        lines.append(quote)
+        lines.append("```")
+        lines.append("")
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def persist_outputs(index_data, retain_data):
+    write_json(index_json, index_data)
+    write_json(retain_json, retain_data)
+    write_json(snap_index_json, index_data)
+    if write_md:
+        write_text(index_md, render_index_md(index_data))
+        write_text(detail_md, render_detail_md(index_data))
+        write_text(snap_index_md, render_index_md(index_data))
+        write_text(snap_detail_md, render_detail_md(index_data))
+
 
 # Load retain.json
-retain = {"pinned_ids": [], "drop_ids": [], "manual_status": {}}
+retain = {}
 if os.path.exists(retain_json):
     try:
         retain = json.load(open(retain_json, "r", encoding="utf-8"))
     except Exception:
-        pass
+        retain = {}
+
+if not isinstance(retain, dict):
+    retain = {}
+
+retain.setdefault("pinned_ids", [])
+retain.setdefault("drop_ids", [])
+retain.setdefault("archived_ids", [])
+
+manual_status = retain.get("manual_status")
+if isinstance(manual_status, dict):
+    for item_id, status in manual_status.items():
+        if status == "archived":
+            add_unique(retain["archived_ids"], item_id)
+        elif status == "dropped":
+            add_unique(retain["drop_ids"], item_id)
+        elif status == "pinned":
+            add_unique(retain["pinned_ids"], item_id)
 
 # Load previous index.json
-prev_index = {"items": [], "history": []}
+prev_index = {"items": []}
 if os.path.exists(index_json):
     try:
         prev_index = json.load(open(index_json, "r", encoding="utf-8"))
     except Exception:
-        pass
+        prev_index = {"items": []}
 
 prev_items = prev_index.get("items", [])
 
-# If no sessions-index.json
-if not os.path.exists(sess_index):
+for prev in prev_items:
+    pid = prev.get("id")
+    if not pid:
+        continue
+    if prev.get("status") == "archived":
+        add_unique(retain["archived_ids"], pid)
+    if prev.get("status") == "dropped":
+        add_unique(retain["drop_ids"], pid)
+    if prev.get("pinned"):
+        add_unique(retain["pinned_ids"], pid)
+
+
+def cleaned_retain():
+    return {
+        "pinned_ids": list(dict.fromkeys(retain.get("pinned_ids", []))),
+        "drop_ids": list(dict.fromkeys(retain.get("drop_ids", []))),
+        "archived_ids": list(dict.fromkeys(retain.get("archived_ids", [])))
+    }
+
+
+sess_index = find_sessions_index(project_root)
+project_dir = os.path.join(home, ".claude", "projects", project_root.replace("/", "-"))
+
+# Prefer the newest session log between sessions-index and raw jsonl files
+session_path = None
+session_id = None
+
+index_path = None
+index_id = None
+if os.path.exists(sess_index):
+    index_path, index_id = pick_session_from_index(sess_index)
+
+latest_path, latest_id = pick_latest_jsonl(project_dir)
+
+
+def mtime(path: str) -> float:
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return -1
+
+
+if index_path and latest_path:
+    if mtime(latest_path) >= mtime(index_path):
+        session_path, session_id = latest_path, latest_id
+    else:
+        session_path, session_id = index_path, index_id
+elif index_path:
+    session_path, session_id = index_path, index_id
+elif latest_path:
+    session_path, session_id = latest_path, latest_id
+
+if not session_path:
     index_data = {
-        "version": 1,
+        "version": 2,
         "generated": timestamp,
         "project": project_root,
         "session_id": None,
         "source": sess_index,
         "items": [],
-        "history": [],
-        "status": "sessions-index.json not found"
-    }
-    detail_data = {
-        "version": 1,
-        "generated": timestamp,
-        "project": project_root,
-        "session_id": None,
-        "source": sess_index,
-        "chunks": []
-    }
-    write_json(index_json, index_data)
-    write_json(detail_json, detail_data)
-    write_text(index_md, "# Index (auto)\n")
-    write_text(detail_md, "# Detail (auto)\n")
-    write_json(snap_index_json, index_data)
-    write_json(snap_detail_json, detail_data)
-    write_text(snap_index_md, pathlib.Path(index_md).read_text(encoding="utf-8"))
-    write_text(snap_detail_md, pathlib.Path(detail_md).read_text(encoding="utf-8"))
-    raise SystemExit(0)
-
-with open(sess_index, "r", encoding="utf-8") as f:
-    data = json.load(f)
-
-entries = data.get("entries", [])
-if not entries:
-    index_data = {
-        "version": 1,
-        "generated": timestamp,
-        "project": project_root,
-        "session_id": None,
-        "source": sess_index,
-        "items": [],
-        "history": [],
         "status": "no session entries"
     }
-    detail_data = {
-        "version": 1,
-        "generated": timestamp,
-        "project": project_root,
-        "session_id": None,
-        "source": sess_index,
-        "chunks": []
-    }
-    write_json(index_json, index_data)
-    write_json(detail_json, detail_data)
-    write_text(index_md, "# Index (auto)\n")
-    write_text(detail_md, "# Detail (auto)\n")
-    write_json(snap_index_json, index_data)
-    write_json(snap_detail_json, detail_data)
-    write_text(snap_index_md, pathlib.Path(index_md).read_text(encoding="utf-8"))
-    write_text(snap_detail_md, pathlib.Path(detail_md).read_text(encoding="utf-8"))
+    persist_outputs(index_data, cleaned_retain())
     raise SystemExit(0)
-
-latest = max(entries, key=lambda e: e.get("modified") or e.get("fileMtime") or 0)
-session_path = latest.get("fullPath")
-session_id = latest.get("sessionId")
 
 if not session_path or not os.path.exists(session_path):
     index_data = {
-        "version": 1,
+        "version": 2,
         "generated": timestamp,
         "project": project_root,
         "session_id": session_id,
         "source": session_path,
         "items": [],
-        "history": [],
         "status": "session log not found"
     }
-    detail_data = {
-        "version": 1,
-        "generated": timestamp,
-        "project": project_root,
-        "session_id": session_id,
-        "source": session_path,
-        "chunks": []
-    }
-    write_json(index_json, index_data)
-    write_json(detail_json, detail_data)
-    write_text(index_md, "# Index (auto)\n")
-    write_text(detail_md, "# Detail (auto)\n")
-    write_json(snap_index_json, index_data)
-    write_json(snap_detail_json, detail_data)
-    write_text(snap_index_md, pathlib.Path(index_md).read_text(encoding="utf-8"))
-    write_text(snap_detail_md, pathlib.Path(detail_md).read_text(encoding="utf-8"))
+    persist_outputs(index_data, cleaned_retain())
     raise SystemExit(0)
 
 # Parse session log
@@ -256,61 +398,19 @@ with open(session_path, "r", encoding="utf-8") as f:
 
 if not messages:
     index_data = {
-        "version": 1,
+        "version": 2,
         "generated": timestamp,
         "project": project_root,
         "session_id": session_id,
         "source": session_path,
         "items": [],
-        "history": [],
         "status": "no text messages"
     }
-    detail_data = {
-        "version": 1,
-        "generated": timestamp,
-        "project": project_root,
-        "session_id": session_id,
-        "source": session_path,
-        "chunks": []
-    }
-    write_json(index_json, index_data)
-    write_json(detail_json, detail_data)
-    write_text(index_md, "# Index (auto)\n")
-    write_text(detail_md, "# Detail (auto)\n")
-    write_json(snap_index_json, index_data)
-    write_json(snap_detail_json, detail_data)
-    write_text(snap_index_md, pathlib.Path(index_md).read_text(encoding="utf-8"))
-    write_text(snap_detail_md, pathlib.Path(detail_md).read_text(encoding="utf-8"))
+    persist_outputs(index_data, cleaned_retain())
     raise SystemExit(0)
 
+
 # Heuristics
-latest_user = next((m for m in reversed(messages) if m["role"] == "user"), None)
-text_window = messages[-50:]
-recent = messages[-3:]
-
-keywords_decisions = ["决定", "采用", "使用", "选择", "改为", "计划"]
-keywords_constraints = ["不要", "禁止", "必须", "避免", "不得", "不能", "敏感", "隐私"]
-keywords_todos = ["TODO", "待办", "- [ ]"]
-
-
-def find_lines(msgs, keywords):
-    found = []
-    for m in msgs:
-        for line in m["text"].splitlines():
-            if any(k in line for k in keywords):
-                line = line.strip()
-                if line and line not in found:
-                    found.append(line)
-    return found[:5]
-
-
-def extract_questions(text: str):
-    if not text:
-        return []
-    parts = re.split(r"[?？]", text)
-    qs = [p.strip() for p in parts[:-1] if p.strip()]
-    return [q + "?" for q in qs[:5]]
-
 
 def is_noise(text: str):
     t = text.strip()
@@ -322,97 +422,120 @@ def is_noise(text: str):
         return True
     if "command-name" in t or "command-args" in t or "command-message" in t:
         return True
+    if "system-reminder" in t.lower():
+        return True
+    if "Called the Read tool" in t or "Result of calling the Read tool" in t:
+        return True
     if t in {"Connected to Obsidian."}:
         return True
     return False
 
-latest_user_clean = next((m for m in reversed(messages) if m["role"] == "user" and not is_noise(m["text"])), latest_user)
 
-# Build detail chunks
-chunks = []
-for i, m in enumerate(messages[-30:]):
-    cid = f"det_{hashlib.sha1((m['timestamp'] + str(i)).encode('utf-8')).hexdigest()[:10]}"
-    chunks.append({
-        "id": cid,
-        "role": m["role"],
-        "timestamp": m["timestamp"],
-        "text": m["text"]
-    })
-
-chunk_ids = [c["id"] for c in chunks[-3:]]
-
-# Candidate items
 candidates = []
+MAX_ITEMS = 12
+SIM_THRESHOLD = 0.7
 
-def add_item(item_type: str, summary: str):
-    summary = truncate(summary)
-    if not summary:
-        return
-    candidates.append({
-        "id": stable_id(item_type, summary),
-        "type": item_type,
-        "summary": summary,
+
+def add_candidate(line: str) -> bool:
+    cleaned = clean_line(line)
+    if not cleaned or len(cleaned) < 4:
+        return False
+    for c in candidates:
+        if similarity(c["clean"], cleaned) >= SIM_THRESHOLD:
+            return False
+    candidates.append({"raw": line.strip(), "clean": cleaned})
+    return True
+
+
+for m in messages[-50:]:
+    if is_noise(m["text"]):
+        continue
+    for raw_line in m["text"].splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        add_candidate(line)
+        if len(candidates) >= MAX_ITEMS:
+            break
+    if len(candidates) >= MAX_ITEMS:
+        break
+
+
+items = []
+for cand in candidates:
+    title = make_title(cand["clean"]) or make_title(cand["raw"])
+    description = make_description(cand["clean"]) or make_description(cand["raw"])
+    summary = make_summary(cand["clean"]) or make_summary(cand["raw"])
+    quote = cand["raw"]
+    items.append({
+        "id": stable_id(description),
+        "title": title,
+        "description": description,
+        "detail": {
+            "summary": summary,
+            "quote": quote
+        },
         "status": "active",
-        "pinned": False,
-        "detail_refs": chunk_ids,
-        "source": "heuristic",
-        "created_at": timestamp,
-        "updated_at": timestamp
+        "pinned": False
     })
 
-if latest_user_clean and latest_user_clean.get("text") and not is_noise(latest_user_clean["text"]):
-    add_item("focus", f"{latest_user_clean['text']}")
 
-for d in find_lines(text_window, keywords_decisions):
-    add_item("decision", d)
+def prev_text(item) -> str:
+    return item.get("description") or item.get("summary") or item.get("title") or ""
 
-for c in find_lines(text_window, keywords_constraints):
-    add_item("constraint", c)
 
-for t in find_lines(text_window, keywords_todos):
-    add_item("todo", t)
+def normalize_prev_item(prev):
+    text = redact(prev_text(prev))
+    title = prev.get("title") or truncate(text, 48)
+    description = prev.get("description") or prev.get("summary") or text
+    detail = prev.get("detail")
+    if isinstance(detail, dict):
+        summary = detail.get("summary") or description
+        quote = detail.get("quote") or text
+    else:
+        summary = description
+        quote = text
+    return {
+        "id": prev.get("id") or stable_id(description),
+        "title": truncate(title, 60),
+        "description": truncate(description, 140),
+        "detail": {
+            "summary": truncate(summary, 160),
+            "quote": quote
+        },
+        "status": "active",
+        "pinned": bool(prev.get("pinned"))
+    }
 
-for q in extract_questions(latest_user_clean["text"] if latest_user_clean else ""):
-    add_item("question", q)
 
-# Match with previous items
-threshold = 0.6
 used_prev = set()
-active_items = []
-history_items = []
+MATCH_THRESHOLD = 0.65
 
-for cand in candidates:
+for item in items:
     best = None
     best_score = 0.0
     for prev in prev_items:
-        if prev.get("type") != cand["type"]:
+        pid = prev.get("id")
+        if not pid or pid in used_prev:
             continue
-        if prev.get("id") in used_prev:
-            continue
-        score = similarity(prev.get("summary", ""), cand.get("summary", ""))
+        score = similarity(prev_text(prev), item.get("description", ""))
         if score > best_score:
             best_score = score
             best = prev
-    if best and best_score >= threshold:
+    if best and best_score >= MATCH_THRESHOLD:
         used_prev.add(best.get("id"))
-        cand["id"] = best.get("id")
-        if best.get("summary") != cand.get("summary"):
-            cand["status"] = "updated"
-            history_items.append({**best, "status": "updated", "updated_to": cand["id"], "updated_at": timestamp})
-        cand["pinned"] = bool(best.get("pinned"))
-    active_items.append(cand)
+        item["id"] = best.get("id", item["id"])
+        if best.get("pinned"):
+            item["pinned"] = True
 
-# Carry over pinned prev items not matched
+retain_ids_to_keep = set(retain.get("pinned_ids", [])) | set(retain.get("archived_ids", [])) | set(retain.get("drop_ids", []))
+
 for prev in prev_items:
-    if prev.get("id") in used_prev:
+    pid = prev.get("id")
+    if not pid or pid in used_prev:
         continue
-    if prev.get("pinned"):
-        active_items.append({**prev, "status": "active", "updated_at": timestamp})
-    else:
-        status = "archived"
-        if prev.get("id") in retain.get("drop_ids", []):
-            status = "dropped"
-        history_items.append({**prev, "status": status, "updated_at": timestamp})
+    if prev.get("pinned") or pid in retain_ids_to_keep:
+        items.append(normalize_prev_item(prev))
 
 # Interactive CLI
 interactive_flag = os.environ.get("INDEX_DETAIL_INTERACTIVE", "1") != "0"
@@ -433,8 +556,8 @@ if interactive_flag:
 
 if input_fn:
     print("\n[Index/Detail] 选择保留项 (Enter=Keep, d=Drop, p=Pin, a=Archive, q=Quit)")
-    for item in active_items[:]:
-        prompt = f"[{item['type']}] {item['summary']}"
+    for item in items[:]:
+        prompt = f"{item['title']} — {item['description']}"
         print(prompt)
         try:
             choice = input_fn("选择 (K/d/p/a/q): ").strip().lower()
@@ -443,14 +566,17 @@ if input_fn:
         if choice == "q":
             break
         if choice == "d":
-            retain.setdefault("drop_ids", []).append(item["id"])
-            item["status"] = "dropped"
+            add_unique(retain["drop_ids"], item["id"])
+            remove_if_present(retain["pinned_ids"], item["id"])
+            remove_if_present(retain["archived_ids"], item["id"])
         elif choice == "p":
-            retain.setdefault("pinned_ids", []).append(item["id"])
-            item["pinned"] = True
+            add_unique(retain["pinned_ids"], item["id"])
+            remove_if_present(retain["drop_ids"], item["id"])
+            remove_if_present(retain["archived_ids"], item["id"])
         elif choice == "a":
-            retain.setdefault("manual_status", {})[item["id"]] = "archived"
-            item["status"] = "archived"
+            add_unique(retain["archived_ids"], item["id"])
+            remove_if_present(retain["pinned_ids"], item["id"])
+            remove_if_present(retain["drop_ids"], item["id"])
         else:
             # keep
             pass
@@ -460,114 +586,43 @@ if input_fn:
 # Apply retain rules
 pinned_ids = set(retain.get("pinned_ids", []))
 drop_ids = set(retain.get("drop_ids", []))
-manual_status = retain.get("manual_status", {})
+archived_ids = set(retain.get("archived_ids", []))
 
-final_active = []
-for item in active_items:
-    if item["id"] in drop_ids:
-        history_items.append({**item, "status": "dropped", "updated_at": timestamp})
+final_items = []
+seen_ids = set()
+
+for item in items:
+    item_id = item.get("id")
+    if not item_id or item_id in seen_ids:
         continue
-    if item["id"] in pinned_ids:
-        item["pinned"] = True
-    if item["id"] in manual_status:
-        st = manual_status[item["id"]]
-        if st in ("archived", "dropped"):
-            history_items.append({**item, "status": st, "updated_at": timestamp})
-            continue
-        if st == "pinned":
+    seen_ids.add(item_id)
+
+    if item_id in drop_ids:
+        item["status"] = "dropped"
+        item["pinned"] = False
+    elif item_id in archived_ids:
+        item["status"] = "archived"
+        item["pinned"] = False
+    else:
+        item["status"] = "active"
+        if item_id in pinned_ids:
             item["pinned"] = True
-    item["status"] = "active" if item.get("status") not in ("updated",) else item.get("status")
-    final_active.append(item)
 
-# Render MD
+    final_items.append(item)
 
-def render_index_md(data):
-    lines = [
-        "# Index (auto)",
-        f"> Generated: {data.get('generated')}",
-        f"> Project: {data.get('project')}",
-        f"> Session: {data.get('session_id')}",
-        f"> Source: {data.get('source')}",
-        ""
-    ]
-
-    by_type = {}
-    for item in data.get("items", []):
-        by_type.setdefault(item.get("type", "other"), []).append(item)
-
-    def fmt(item):
-        flags = []
-        if item.get("pinned"):
-            flags.append("PIN")
-        if item.get("status") == "updated":
-            flags.append("UPDATED")
-        suffix = f" [{'|'.join(flags)}]" if flags else ""
-        return f"- {item.get('summary')}{suffix}"
-
-    for t in ["focus", "decision", "constraint", "todo", "question"]:
-        if t in by_type:
-            title = t.capitalize() if t != "todo" else "Todo"
-            lines += [f"## {title}"]
-            lines += [fmt(i) for i in by_type[t]]
-            lines.append("")
-
-    # History summary
-    hist = data.get("history", [])
-    if hist:
-        lines += ["## History (archived/updated/dropped)"]
-        for h in hist[-10:]:
-            lines.append(f"- {h.get('summary')} [{h.get('status')}]" )
-        lines.append("")
-
-    return "\n".join(lines).strip() + "\n"
-
-
-def render_detail_md(data):
-    lines = [
-        "# Detail (auto)",
-        f"> Generated: {data.get('generated')}",
-        f"> Project: {data.get('project')}",
-        f"> Session: {data.get('session_id')}",
-        f"> Source: {data.get('source')}",
-        "",
-        "## Transcript (last 30 messages)"
-    ]
-    for chunk in data.get("chunks", []):
-        lines.append(f"### {chunk.get('role')} @ {chunk.get('timestamp')}")
-        lines.append(chunk.get("text", ""))
-        lines.append("")
-    return "\n".join(lines).strip() + "\n"
+status_order = {"active": 0, "archived": 1, "dropped": 2}
+final_items.sort(key=lambda i: (status_order.get(i.get("status"), 9), 0 if i.get("pinned") else 1))
 
 # Build JSON outputs
 index_data = {
-    "version": 1,
+    "version": 2,
     "generated": timestamp,
     "project": project_root,
     "session_id": session_id,
     "source": session_path,
-    "items": final_active,
-    "history": history_items
-}
-
-detail_data = {
-    "version": 1,
-    "generated": timestamp,
-    "project": project_root,
-    "session_id": session_id,
-    "source": session_path,
-    "chunks": chunks
+    "items": final_items
 }
 
 # Persist outputs
-write_json(index_json, index_data)
-write_json(detail_json, detail_data)
-write_json(retain_json, retain)
-write_text(index_md, render_index_md(index_data))
-write_text(detail_md, render_detail_md(detail_data))
-
-# Snapshots
-write_json(snap_index_json, index_data)
-write_json(snap_detail_json, detail_data)
-write_text(snap_index_md, render_index_md(index_data))
-write_text(snap_detail_md, render_detail_md(detail_data))
+persist_outputs(index_data, cleaned_retain())
 PY

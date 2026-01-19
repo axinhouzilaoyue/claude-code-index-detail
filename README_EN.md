@@ -1,21 +1,37 @@
 # Claude Code Index/Detail Context Compaction
 
-An Index/Detail compaction tool for Claude Code. It hooks into **PreCompact** to generate a concise index and a detailed transcript, reducing token usage while preserving critical context.
+An Index/Detail compaction tool for Claude Code. It hooks into **PreCompact** to generate simplified cards (Index) and on-demand details (Detail), reducing token usage while preserving critical context.
 
 ## Overview
 This tool generates a two-layer context snapshot before compaction:
-- **Index layer**: decisions, constraints, TODOs, and open questions required to continue the task.
-- **Detail layer**: the last ~30 raw messages for on‑demand recovery.
+- **Index layer**: card list (`id / title / description / status / pinned`).
+- **Detail layer**: per-card `summary + quote` located by `id`.
 
 ## Motivation
-Claude Code compaction can drop key decisions or constraints in long conversations. This tool keeps the context lightweight while preserving recoverability via structured index + detailed transcript.
+Claude Code compaction can drop key decisions or constraints in long conversations. This tool keeps the context lightweight while preserving recoverability via structured index + detail cards.
 
 ## Features
-- PreCompact Hook generates `index.md` / `detail.md`
-- Structured `index.json` / `detail.json`
-- Lifecycle across rounds: Active / Updated / Archived / Dropped
+- Structured `index.json` (detail merged into each item; no `detail.json` output)
+- Optional `index.md` / `detail.md` output (enabled by default)
+- Lifecycle across rounds: Active / Archived / Dropped
 - Interactive CLI selection (Keep / Drop / Pin / Archive)
 - Snapshot history in `snapshots/`
+- 1:1 Index/Detail mapping with `id`-based loading
+
+## Card schema (JSON)
+```json
+{
+  "id": "item_xxx",
+  "title": "<short title>",
+  "description": "<1-sentence summary>",
+  "detail": {
+    "summary": "<1-2 sentence recap>",
+    "quote": "<raw excerpt>"
+  },
+  "status": "active|archived|dropped",
+  "pinned": false
+}
+```
 
 ## Prerequisites
 - **Claude Code** installed
@@ -50,16 +66,21 @@ Edit `~/.claude/settings.json` and add under `hooks`:
   INDEX_DETAIL_INTERACTIVE=0
   ```
 
+- **Markdown output toggle** (enabled by default):
+  ```bash
+  INDEX_DETAIL_WRITE_MD=0
+  ```
+  Set to `0` to only output `index.json` / `retain.json` (no `index.md` / `detail.md`).
+
 - **retain.json** (optional manual edits):
   ```json
   {
     "pinned_ids": [],
     "drop_ids": [],
-    "manual_status": {
-      "id": "archived"
-    }
+    "archived_ids": []
   }
   ```
+  > If older versions included `manual_status`, the script migrates it into these three lists.
 
 ## Usage
 ### 1) Normal Claude Code usage
@@ -75,7 +96,19 @@ When compaction triggers, the hook runs automatically.
 - a = Archive
 - q = Quit
 
-### 3) Manual test run
+### 3) Load detail by id
+1) Find the target `id` in `index.md`.
+2) Search for `## <id> — <title>` in `detail.md`.
+
+(Optional) Add a local helper function:
+```bash
+show-detail() {
+  local id="$1"
+  sed -n "/^## ${id} —/,/^## /p" ".claude/detail.md"
+}
+```
+
+### 4) Manual test run
 ```bash
 ~/.claude/hooks/precompact-index-detail.sh
 ```
@@ -83,12 +116,16 @@ When compaction triggers, the hook runs automatically.
 ## Output structure
 ```
 <project>/.claude/
-  index.md
-  detail.md
   index.json
-  detail.json
   retain.json
   snapshots/
+    <ts>.index.json
+
+# Optional (enabled by default):
+# index.md
+# detail.md
+# snapshots/<ts>.index.md
+# snapshots/<ts>.detail.md
 ```
 
 ## Security & Privacy
